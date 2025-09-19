@@ -3,38 +3,34 @@
   <PropertyGroup>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo><!-- setting GenerateAssemblyInfo to false causes this bug https://github.com/dotnet/project-system/issues/3934 -->
     <TargetFramework>netstandard2.0</TargetFramework>
-    <AssemblyName>VRChat.API</AssemblyName>
-    <PackageId>VRChat.API</PackageId>
+    <AssemblyName>VRChat.API.Websockets</AssemblyName>
+    <PackageId>VRChat.API.Websockets</PackageId>
     <OutputType>Library</OutputType>
-    <Authors>VRChat API Docs Community</Authors>
-    <Company>VRChat API Docs Community</Company>
-    <AssemblyTitle>VRChat API Library for .NET</AssemblyTitle>
-    <Description>VRChat API Library for .NET</Description>
-    <Copyright>Copyright © 2021 Owners of GitHub organisation "vrchatapi" and individual contributors.</Copyright>
+    <Authors>Exil_S</Authors>
+    <Company>Exil_S</Company>
+    <AssemblyTitle>VRChat API Library for .NET with Websocket Support</AssemblyTitle>
+    <Description>VRChat API Library for .NET with Websocket Support</Description>
+    <Copyright>Copyright © 2021 Owners of GitHub organisation "vrchatapi", individual contributors and Exil_S.</Copyright>
     <RootNamespace>VRChat.API</RootNamespace>
     <Version>1.20.3</Version>
-    <DocumentationFile>bin\$(Configuration)\$(TargetFramework)\VRChat.API.xml</DocumentationFile>
+    <DocumentationFile>bin\$(Configuration)\$(TargetFramework)\VRChat.API.WebSockets.xml</DocumentationFile>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/vrchatapi/vrchatapi-csharp.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageReleaseNotes>Automated deployment</PackageReleaseNotes>
     <PackageTags>vrchat</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <NoWarn>$(NoWarn);0612;1591;0067</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="JsonSubTypes" Version="1.9.0" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
-    <PackageReference Include="RestSharp" Version="108.0.2" />
     <PackageReference Include="Polly" Version="7.2.3" />
     <PackageReference Include="System.ComponentModel.Annotations" Version="5.0.0" />
-    <None Include="..\README.md" Pack="true" PackagePath="\"/>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>
     <None Remove="System.Web" />
-  </ItemGroup>
-  <ItemGroup>
-    <Reference Include="System.Web" />
   </ItemGroup>
 </Project>

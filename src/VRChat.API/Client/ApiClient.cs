@@ -15,6 +15,8 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Reflection;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Formatters;
@@ -24,20 +26,16 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
-using RestSharp;
-using RestSharp.Serializers;
-using RestSharpMethod = RestSharp.Method;
 using Polly;
 
 namespace VRChat.API.Client
 {
     /// <summary>
-    /// Allows RestSharp to Serialize/Deserialize JSON using our custom logic, but only when ContentType is JSON.
+    /// Custom JSON serializer that handles the VRChat API specific serialization requirements
     /// </summary>
-    internal class CustomJsonCodec : IRestSerializer, ISerializer, IDeserializer
+    internal class CustomJsonCodec
     {
         private readonly IReadableConfiguration _configuration;
-        private static readonly string _contentType = "application/json";
         private readonly JsonSerializerSettings _serializerSettings = new JsonSerializerSettings
         {
             // OpenAPI generated types generally hide default constructors.
@@ -80,90 +78,66 @@ namespace VRChat.API.Client
             }
         }
 
-        public string Serialize(Parameter bodyParameter) => Serialize(bodyParameter.Value);
-
-        public T Deserialize<T>(RestResponse response)
-        {
-            var result = (T)Deserialize(response, typeof(T));
-            return result;
-        }
-
         /// <summary>
         /// Deserialize the JSON string into a proper object.
         /// </summary>
-        /// <param name="response">The HTTP response.</param>
+        /// <param name="content">The HTTP response content.</param>
         /// <param name="type">Object type.</param>
+        /// <param name="headers">Response headers.</param>
+        /// <param name="rawBytes">Raw response bytes.</param>
         /// <returns>Object representation of the JSON string.</returns>
-        internal object Deserialize(RestResponse response, Type type)
+        internal object Deserialize(string content, Type type, HttpResponseHeaders headers, byte[] rawBytes)
         {
             if (type == typeof(byte[])) // return byte array
             {
-                return response.RawBytes;
+                return rawBytes;
             }
 
-            // TODO: ? if (type.IsAssignableFrom(typeof(Stream)))
             if (type == typeof(Stream))
             {
-                var bytes = response.RawBytes;
-                if (response.Headers != null)
+                if (headers != null)
                 {
                     var filePath = string.IsNullOrEmpty(_configuration.TempFolderPath)
                         ? Path.GetTempPath()
                         : _configuration.TempFolderPath;
                     var regex = new Regex(@"Content-Disposition=.*filename=['""]?([^'""\s]+)['""]?$");
-                    foreach (var header in response.Headers)
+                    foreach (var header in headers)
                     {
-                        var match = regex.Match(header.ToString());
+                        var match = regex.Match($"{header.Key}={string.Join(",", header.Value)}");
                         if (match.Success)
                         {
                             string fileName = filePath + ClientUtils.SanitizeFilename(match.Groups[1].Value.Replace("\"", "").Replace("'", ""));
-                            File.WriteAllBytes(fileName, bytes);
+                            File.WriteAllBytes(fileName, rawBytes);
                             return new FileStream(fileName, FileMode.Open);
                         }
                     }
                 }
-                var stream = new MemoryStream(bytes);
+                var stream = new MemoryStream(rawBytes);
                 return stream;
             }
 
             if (type.Name.StartsWith("System.Nullable`1[[System.DateTime")) // return a datetime object
             {
-                return DateTime.Parse(response.Content, null, System.Globalization.DateTimeStyles.RoundtripKind);
+                return DateTime.Parse(content, null, System.Globalization.DateTimeStyles.RoundtripKind);
             }
 
             if (type == typeof(string) || type.Name.StartsWith("System.Nullable")) // return primitive type
             {
-                return Convert.ChangeType(response.Content, type);
+                return Convert.ChangeType(content, type);
             }
 
             // at this point, it must be a model (json)
             try
             {
-                return JsonConvert.DeserializeObject(response.Content, type, _serializerSettings);
+                return JsonConvert.DeserializeObject(content, type, _serializerSettings);
             }
             catch (Exception e)
             {
                 throw new ApiException(500, e.Message);
             }
         }
-
-        public ISerializer Serializer => this;
-        public IDeserializer Deserializer => this;
-
-        public string[] AcceptedContentTypes => RestSharp.Serializers.ContentType.JsonAccept;
-
-        public SupportsContentType SupportsContentType => contentType =>
-            contentType.EndsWith("json", StringComparison.InvariantCultureIgnoreCase) ||
-            contentType.EndsWith("javascript", StringComparison.InvariantCultureIgnoreCase);
-
-        public string ContentType
-        {
-            get { return _contentType; }
-            set { throw new InvalidOperationException("Not allowed to set content type."); }
-        }
-
-        public DataFormat DataFormat => DataFormat.Json;
     }
+
     /// <summary>
     /// Provides a default implementation of an Api client (both synchronous and asynchronous implementations),
     /// encapsulating general REST accessor use cases.
@@ -172,7 +146,7 @@ namespace VRChat.API.Client
     {
         private readonly string _baseUrl;
         public static readonly CookieContainer CookieContainer = new CookieContainer();
-
+        private readonly HttpClient _httpClient;
 
         /// <summary>
         /// Specifies the settings on a <see cref="JsonSerializer" /> object.
@@ -194,15 +168,15 @@ namespace VRChat.API.Client
         /// <summary>
         /// Allows for extending request processing for <see cref="ApiClient"/> generated code.
         /// </summary>
-        /// <param name="request">The RestSharp request object</param>
-        partial void InterceptRequest(RestRequest request);
+        /// <param name="request">The HttpRequestMessage object</param>
+        partial void InterceptRequest(HttpRequestMessage request);
 
         /// <summary>
         /// Allows for extending response processing for <see cref="ApiClient"/> generated code.
         /// </summary>
-        /// <param name="request">The RestSharp request object</param>
-        /// <param name="response">The RestSharp response object</param>
-        partial void InterceptResponse(RestRequest request, RestResponse response);
+        /// <param name="request">The HttpRequestMessage object</param>
+        /// <param name="response">The HttpResponseMessage object</param>
+        partial void InterceptResponse(HttpRequestMessage request, HttpResponseMessage response);
 
         /// <summary>
         /// Initializes a new instance of the <see cref="ApiClient" />, defaulting to the global configurations' base url.
@@ -210,6 +184,11 @@ namespace VRChat.API.Client
         public ApiClient()
         {
             _baseUrl = VRChat.API.Client.GlobalConfiguration.Instance.BasePath;
+            var handler = new HttpClientHandler()
+            {
+                CookieContainer = CookieContainer
+            };
+            _httpClient = new HttpClient(handler);
         }
 
         /// <summary>
@@ -223,60 +202,55 @@ namespace VRChat.API.Client
                 throw new ArgumentException("basePath cannot be empty");
 
             _baseUrl = basePath;
+            var handler = new HttpClientHandler()
+            {
+                CookieContainer = CookieContainer
+            };
+            _httpClient = new HttpClient(handler);
         }
 
         /// <summary>
-        /// Constructs the RestSharp version of an http method
+        /// Constructs the HttpMethod from the enum
         /// </summary>
-        /// <param name="method">Swagger Client Custom HttpMethod</param>
-        /// <returns>RestSharp's HttpMethod instance.</returns>
+        /// <param name="method">Custom HttpMethod enum</param>
+        /// <returns>System.Net.Http.HttpMethod instance.</returns>
         /// <exception cref="ArgumentOutOfRangeException"></exception>
-        private RestSharpMethod Method(HttpMethod method)
+        private System.Net.Http.HttpMethod GetHttpMethod(HttpMethod method)
         {
-            RestSharpMethod other;
             switch (method)
             {
                 case HttpMethod.Get:
-                    other = RestSharpMethod.Get;
-                    break;
+                    return System.Net.Http.HttpMethod.Get;
                 case HttpMethod.Post:
-                    other = RestSharpMethod.Post;
-                    break;
+                    return System.Net.Http.HttpMethod.Post;
                 case HttpMethod.Put:
-                    other = RestSharpMethod.Put;
-                    break;
+                    return System.Net.Http.HttpMethod.Put;
                 case HttpMethod.Delete:
-                    other = RestSharpMethod.Delete;
-                    break;
+                    return System.Net.Http.HttpMethod.Delete;
                 case HttpMethod.Head:
-                    other = RestSharpMethod.Head;
-                    break;
+                    return System.Net.Http.HttpMethod.Head;
                 case HttpMethod.Options:
-                    other = RestSharpMethod.Options;
-                    break;
+                    return System.Net.Http.HttpMethod.Options;
                 case HttpMethod.Patch:
-                    other = RestSharpMethod.Patch;
-                    break;
+                    return new System.Net.Http.HttpMethod("PATCH");
                 default:
                     throw new ArgumentOutOfRangeException("method", method, null);
             }
-
-            return other;
         }
 
         /// <summary>
-        /// Provides all logic for constructing a new RestSharp <see cref="RestRequest"/>.
+        /// Provides all logic for constructing a new HttpRequestMessage.
         /// At this point, all information for querying the service is known. Here, it is simply
-        /// mapped into the RestSharp request.
+        /// mapped into the HttpRequestMessage.
         /// </summary>
         /// <param name="method">The http verb.</param>
         /// <param name="path">The target path (or resource).</param>
         /// <param name="options">The additional request options.</param>
         /// <param name="configuration">A per-request configuration object. It is assumed that any merge with
         /// GlobalConfiguration has been done before calling this method.</param>
-        /// <returns>[private] A new RestRequest instance.</returns>
+        /// <returns>[private] A new HttpRequestMessage instance.</returns>
         /// <exception cref="ArgumentNullException"></exception>
-        private RestRequest NewRequest(
+        private HttpRequestMessage NewRequest(
             HttpMethod method,
             string path,
             RequestOptions options,
@@ -286,355 +260,249 @@ namespace VRChat.API.Client
             if (options == null) throw new ArgumentNullException("options");
             if (configuration == null) throw new ArgumentNullException("configuration");
 
-            RestRequest request = new RestRequest(path, Method(method));
-
+            var baseUrl = configuration.GetOperationServerUrl(options.Operation, options.OperationIndex) ?? _baseUrl;
+            
+            // Replace path parameters
+            var processedPath = path;
             if (options.PathParameters != null)
             {
                 foreach (var pathParam in options.PathParameters)
                 {
-                    request.AddParameter(pathParam.Key, pathParam.Value, ParameterType.UrlSegment, false);
+                    processedPath = processedPath.Replace($"{{{pathParam.Key}}}", Uri.EscapeDataString(pathParam.Value.ToString()));
                 }
             }
 
-            if (options.QueryParameters != null)
+            // Build query string
+            var queryString = "";
+            if (options.QueryParameters != null && options.QueryParameters.Count > 0)
             {
+                var queryParams = new List<string>();
                 foreach (var queryParam in options.QueryParameters)
                 {
                     foreach (var value in queryParam.Value)
                     {
-                        request.AddQueryParameter(queryParam.Key, value);
+                        queryParams.Add($"{Uri.EscapeDataString(queryParam.Key)}={Uri.EscapeDataString(value)}");
                     }
                 }
+                queryString = "?" + string.Join("&", queryParams);
             }
 
+            var requestUri = new Uri($"{baseUrl.TrimEnd('/')}/{processedPath.TrimStart('/')}{queryString}");
+            var request = new HttpRequestMessage(GetHttpMethod(method), requestUri);
+
+            // Set default headers
             if (configuration.DefaultHeaders != null)
             {
                 foreach (var headerParam in configuration.DefaultHeaders)
                 {
-                    request.AddHeader(headerParam.Key, headerParam.Value);
+                    request.Headers.TryAddWithoutValidation(headerParam.Key, headerParam.Value);
                 }
             }
 
+            // Set request headers
             if (options.HeaderParameters != null)
             {
                 foreach (var headerParam in options.HeaderParameters)
                 {
                     foreach (var value in headerParam.Value)
                     {
-                        request.AddHeader(headerParam.Key, value);
+                        request.Headers.TryAddWithoutValidation(headerParam.Key, value);
                     }
                 }
             }
 
-            if (options.FormParameters != null)
+            // Set User-Agent
+            if (!string.IsNullOrEmpty(configuration.UserAgent))
             {
-                foreach (var formParam in options.FormParameters)
-                {
-                    request.AddParameter(formParam.Key, formParam.Value);
-                }
+                request.Headers.TryAddWithoutValidation("User-Agent", configuration.UserAgent);
             }
 
-            if (options.Data != null)
+            // Handle request body content
+            if (options.FormParameters != null && options.FormParameters.Count > 0)
+            {
+                var formContent = new List<KeyValuePair<string, string>>();
+                foreach (var formParam in options.FormParameters)
+                {
+                    formContent.Add(new KeyValuePair<string, string>(formParam.Key, formParam.Value.ToString()));
+                }
+                request.Content = new FormUrlEncodedContent(formContent);
+            }
+            else if (options.Data != null)
             {
                 if (options.Data is Stream stream)
                 {
                     var contentType = "application/octet-stream";
-                    if (options.HeaderParameters != null)
+                    if (options.HeaderParameters != null && options.HeaderParameters.ContainsKey("Content-Type"))
                     {
-                        var contentTypes = options.HeaderParameters["Content-Type"];
-                        contentType = contentTypes[0];
+                        contentType = options.HeaderParameters["Content-Type"][0];
                     }
 
                     var bytes = ClientUtils.ReadAsBytes(stream);
-                    request.AddParameter(contentType, bytes, ParameterType.RequestBody);
+                    request.Content = new ByteArrayContent(bytes);
+                    request.Content.Headers.TryAddWithoutValidation("Content-Type", contentType);
                 }
                 else
                 {
-                    if (options.HeaderParameters != null)
-                    {
-                        var contentTypes = options.HeaderParameters["Content-Type"];
-                        if (contentTypes == null || contentTypes.Any(header => header.Contains("application/json")))
-                        {
-                            request.RequestFormat = DataFormat.Json;
-                        }
-                        else
-                        {
-                            // TODO: Generated client user should add additional handlers. RestSharp only supports XML and JSON, with XML as default.
-                        }
-                    }
-                    else
-                    {
-                        // Here, we'll assume JSON APIs are more common. XML can be forced by adding produces/consumes to openapi spec explicitly.
-                        request.RequestFormat = DataFormat.Json;
-                    }
-
-                    request.AddJsonBody(options.Data);
+                    var jsonContent = new CustomJsonCodec(SerializerSettings, configuration).Serialize(options.Data);
+                    request.Content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
                 }
             }
-
-            if (options.FileParameters != null)
+            else if (options.FileParameters != null && options.FileParameters.Count > 0)
             {
+                var multipartContent = new MultipartFormDataContent();
                 foreach (var fileParam in options.FileParameters)
                 {
                     foreach (var file in fileParam.Value)
                     {
                         var bytes = ClientUtils.ReadAsBytes(file);
                         var fileStream = file as FileStream;
-                        if (fileStream != null)
-                            request.AddFile(fileParam.Key, bytes, System.IO.Path.GetFileName(fileStream.Name));
-                        else
-                            request.AddFile(fileParam.Key, bytes, "no_file_name_provided");
+                        var fileName = fileStream != null ? Path.GetFileName(fileStream.Name) : "no_file_name_provided";
+                        multipartContent.Add(new ByteArrayContent(bytes), fileParam.Key, fileName);
                     }
                 }
+                request.Content = multipartContent;
             }
 
             return request;
         }
 
-        private ApiResponse<T> ToApiResponse<T>(RestResponse<T> response)
+        private ApiResponse<T> ToApiResponse<T>(HttpResponseMessage response, string content, byte[] rawBytes)
         {
-            T result = response.Data;
-            string rawContent = response.Content;
+            var headers = new Multimap<string, string>();
 
-            var transformed = new ApiResponse<T>(response.StatusCode, new Multimap<string, string>(), result, rawContent)
+            // Add response headers
+            foreach (var header in response.Headers)
             {
-                ErrorText = response.ErrorMessage,
+                headers.Add(header.Key, string.Join(",", header.Value));
+            }
+
+            if (response.Content?.Headers != null)
+            {
+                foreach (var header in response.Content.Headers)
+                {
+                    headers.Add(header.Key, string.Join(",", header.Value));
+                }
+            }
+
+            // Deserialize the response content
+            T data = default(T);
+            string errorText = !response.IsSuccessStatusCode ? response.ReasonPhrase : null;
+
+            if (typeof(T) != typeof(object) && !string.IsNullOrEmpty(content))
+            {
+                var codec = new CustomJsonCodec(SerializerSettings, GlobalConfiguration.Instance);
+                try
+                {
+                    // Handle special response types first
+                    if (typeof(VRChat.API.Model.AbstractOpenAPISchema).IsAssignableFrom(typeof(T)))
+                    {
+                        data = (T)typeof(T).GetMethod("FromJson").Invoke(null, new object[] { content });
+                    }
+                    else if (typeof(T).Name == "Stream") // for binary response
+                    {
+                        data = (T)(object)new MemoryStream(rawBytes);
+                    }
+                    else if (typeof(T).Name == "Byte[]") // for byte response
+                    {
+                        data = (T)(object)rawBytes;
+                    }
+                    else if (typeof(T).Name == "String") // for string response
+                    {
+                        data = (T)(object)content;
+                    }
+                    else
+                    {
+                        data = (T)codec.Deserialize(content, typeof(T), response.Headers, rawBytes);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errorText = ex.Message;
+                }
+            }
+
+            var transformed = new ApiResponse<T>(response.StatusCode, headers, data, content)
+            {
+                ErrorText = errorText,
                 Cookies = new List<Cookie>()
             };
-
-            if (response.Headers != null)
-            {
-                foreach (var responseHeader in response.Headers)
-                {
-                    transformed.Headers.Add(responseHeader.Name, ClientUtils.ParameterToString(responseHeader.Value));
-                }
-            }
-
-            if (response.ContentHeaders != null)
-            {
-                foreach (var responseHeader in response.ContentHeaders)
-                {
-                    transformed.Headers.Add(responseHeader.Name, ClientUtils.ParameterToString(responseHeader.Value));
-                }
-            }
-
-            if (response.Cookies != null)
-            {
-                foreach (var responseCookies in response.Cookies.Cast<Cookie>())
-                {
-                    transformed.Cookies.Add(
-                        new Cookie(
-                            responseCookies.Name,
-                            responseCookies.Value,
-                            responseCookies.Path,
-                            responseCookies.Domain)
-                        );
-                }
-            }
 
             return transformed;
         }
 
-        private ApiResponse<T> Exec<T>(RestRequest req, RequestOptions options, IReadableConfiguration configuration)
+        private ApiResponse<T> Exec<T>(HttpRequestMessage req, RequestOptions options, IReadableConfiguration configuration)
         {
-            var baseUrl = configuration.GetOperationServerUrl(options.Operation, options.OperationIndex) ?? _baseUrl;
-            
-            var cookies = CookieContainer;
-            
-            if (options.Cookies != null && options.Cookies.Count > 0)
+            // Configure HttpClient settings
+            if (configuration.ClientCertificates != null)
             {
-                foreach (var cookie in options.Cookies)
-                {
-                    cookies.Add(new Cookie(cookie.Name, cookie.Value, cookie.Path, cookie.Domain));
-                }
+                // Note: Client certificates need to be handled at HttpClientHandler level during construction
+                // This is a limitation when reusing HttpClient instances
             }
-            
-            var clientOptions = new RestClientOptions(baseUrl)
-            {
-                ClientCertificates = configuration.ClientCertificates,
-                CookieContainer = cookies,
-                MaxTimeout = configuration.Timeout,
-                Proxy = configuration.Proxy,
-                UserAgent = configuration.UserAgent
-            };
 
-            RestClient client = new RestClient(clientOptions)
-                .UseSerializer(() => new CustomJsonCodec(SerializerSettings, configuration));
+            if (configuration.Proxy != null)
+            {
+                // Note: Proxy settings need to be handled at HttpClientHandler level during construction
+                // This is a limitation when reusing HttpClient instances
+            }
+
+            if (configuration.Timeout > 0)
+            {
+                _httpClient.Timeout = TimeSpan.FromMilliseconds(configuration.Timeout);
+            }
 
             InterceptRequest(req);
 
-            RestResponse<T> response;
+            HttpResponseMessage response;
             if (RetryConfiguration.RetryPolicy != null)
             {
                 var policy = RetryConfiguration.RetryPolicy;
-                var policyResult = policy.ExecuteAndCapture(() => client.Execute(req));
-                response = (policyResult.Outcome == OutcomeType.Successful) ? client.Deserialize<T>(policyResult.Result) : new RestResponse<T>
-                {
-                    Request = req,
-                    ErrorException = policyResult.FinalException
-                };
+                var policyResult = policy.ExecuteAndCapture(() => _httpClient.SendAsync(req).Result);
+                response = (policyResult.Outcome == OutcomeType.Successful) ? policyResult.Result : new HttpResponseMessage(HttpStatusCode.InternalServerError);
             }
             else
             {
-                response = client.Execute<T>(req);
+                response = _httpClient.SendAsync(req).Result;
             }
 
-            // if the response type is oneOf/anyOf, call FromJSON to deserialize the data
-            if (typeof(VRChat.API.Model.AbstractOpenAPISchema).IsAssignableFrom(typeof(T)))
-            {
-                try
-                {
-                    response.Data = (T) typeof(T).GetMethod("FromJson").Invoke(null, new object[] { response.Content });
-                }
-                catch (Exception ex)
-                {
-                    throw ex.InnerException != null ? ex.InnerException : ex;
-                }
-            }
-            else if (typeof(T).Name == "Stream") // for binary response
-            {
-                response.Data = (T)(object)new MemoryStream(response.RawBytes);
-            }
-            else if (typeof(T).Name == "Byte[]") // for byte response
-            {
-                response.Data = (T)(object)response.RawBytes;
-            }
-            else if (typeof(T).Name == "String") // for string response
-            {
-                response.Data = (T)(object)response.Content;
-            }
+            var content = response.Content?.ReadAsStringAsync().Result ?? "";
+            var rawBytes = response.Content?.ReadAsByteArrayAsync().Result ?? new byte[0];
 
             InterceptResponse(req, response);
 
-            var result = ToApiResponse(response);
-            if (response.ErrorMessage != null)
-            {
-                result.ErrorText = response.ErrorMessage;
-            }
+            var result = ToApiResponse<T>(response, content, rawBytes);
 
-            if (response.Cookies != null && response.Cookies.Count > 0)
-            {
-                if (result.Cookies == null) result.Cookies = new List<Cookie>();
-                foreach (var restResponseCookie in response.Cookies.Cast<Cookie>())
-                {
-                    var cookie = new Cookie(
-                        restResponseCookie.Name,
-                        restResponseCookie.Value,
-                        restResponseCookie.Path,
-                        restResponseCookie.Domain
-                    )
-                    {
-                        Comment = restResponseCookie.Comment,
-                        CommentUri = restResponseCookie.CommentUri,
-                        Discard = restResponseCookie.Discard,
-                        Expired = restResponseCookie.Expired,
-                        Expires = restResponseCookie.Expires,
-                        HttpOnly = restResponseCookie.HttpOnly,
-                        Port = restResponseCookie.Port,
-                        Secure = restResponseCookie.Secure,
-                        Version = restResponseCookie.Version
-                    };
-
-                    result.Cookies.Add(cookie);
-                    client.CookieContainer.Add(cookie);
-                }
-            }
             return result;
         }
 
-        private async Task<ApiResponse<T>> ExecAsync<T>(RestRequest req, RequestOptions options, IReadableConfiguration configuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken))
+        private async Task<ApiResponse<T>> ExecAsync<T>(HttpRequestMessage req, RequestOptions options, IReadableConfiguration configuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken))
         {
-            var baseUrl = configuration.GetOperationServerUrl(options.Operation, options.OperationIndex) ?? _baseUrl;
-            
-            var cookies = CookieContainer;
-            
-            if (options.Cookies != null && options.Cookies.Count > 0)
+            // Configure HttpClient settings
+            if (configuration.Timeout > 0)
             {
-                foreach (var cookie in options.Cookies)
-                {
-                    cookies.Add(new Cookie(cookie.Name, cookie.Value, cookie.Path, cookie.Domain));
-                }
+                _httpClient.Timeout = TimeSpan.FromMilliseconds(configuration.Timeout);
             }
-            
-            var clientOptions = new RestClientOptions(baseUrl)
-            {
-                ClientCertificates = configuration.ClientCertificates,
-                CookieContainer = cookies,
-                MaxTimeout = configuration.Timeout,
-                Proxy = configuration.Proxy,
-                UserAgent = configuration.UserAgent
-            };
-
-            RestClient client = new RestClient(clientOptions)
-                .UseSerializer(() => new CustomJsonCodec(SerializerSettings, configuration));
 
             InterceptRequest(req);
 
-            RestResponse<T> response;
+            HttpResponseMessage response;
             if (RetryConfiguration.AsyncRetryPolicy != null)
             {
                 var policy = RetryConfiguration.AsyncRetryPolicy;
-                var policyResult = await policy.ExecuteAndCaptureAsync((ct) => client.ExecuteAsync(req, ct), cancellationToken).ConfigureAwait(false);
-                response = (policyResult.Outcome == OutcomeType.Successful) ? client.Deserialize<T>(policyResult.Result) : new RestResponse<T>
-                {
-                    Request = req,
-                    ErrorException = policyResult.FinalException
-                };
+                var policyResult = await policy.ExecuteAndCaptureAsync((ct) => _httpClient.SendAsync(req, ct), cancellationToken).ConfigureAwait(false);
+                response = (policyResult.Outcome == OutcomeType.Successful) ? policyResult.Result : new HttpResponseMessage(HttpStatusCode.InternalServerError);
             }
             else
             {
-                response = await client.ExecuteAsync<T>(req, cancellationToken).ConfigureAwait(false);
+                response = await _httpClient.SendAsync(req, cancellationToken).ConfigureAwait(false);
             }
 
-            // if the response type is oneOf/anyOf, call FromJSON to deserialize the data
-            if (typeof(VRChat.API.Model.AbstractOpenAPISchema).IsAssignableFrom(typeof(T)))
-            {
-                response.Data = (T) typeof(T).GetMethod("FromJson").Invoke(null, new object[] { response.Content });
-            }
-            else if (typeof(T).Name == "Stream") // for binary response
-            {
-                response.Data = (T)(object)new MemoryStream(response.RawBytes);
-            }
-            else if (typeof(T).Name == "Byte[]") // for byte response
-            {
-                response.Data = (T)(object)response.RawBytes;
-            }
+            var content = response.Content != null ? await response.Content.ReadAsStringAsync().ConfigureAwait(false) : "";
+            var rawBytes = response.Content != null ? await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false) : new byte[0];
 
             InterceptResponse(req, response);
 
-            var result = ToApiResponse(response);
-            if (response.ErrorMessage != null)
-            {
-                result.ErrorText = response.ErrorMessage;
-            }
+            var result = ToApiResponse<T>(response, content, rawBytes);
 
-            if (response.Cookies != null && response.Cookies.Count > 0)
-            {
-                if (result.Cookies == null) result.Cookies = new List<Cookie>();
-                foreach (var restResponseCookie in response.Cookies.Cast<Cookie>())
-                {
-                    var cookie = new Cookie(
-                        restResponseCookie.Name,
-                        restResponseCookie.Value,
-                        restResponseCookie.Path,
-                        restResponseCookie.Domain
-                    )
-                    {
-                        Comment = restResponseCookie.Comment,
-                        CommentUri = restResponseCookie.CommentUri,
-                        Discard = restResponseCookie.Discard,
-                        Expired = restResponseCookie.Expired,
-                        Expires = restResponseCookie.Expires,
-                        HttpOnly = restResponseCookie.HttpOnly,
-                        Port = restResponseCookie.Port,
-                        Secure = restResponseCookie.Secure,
-                        Version = restResponseCookie.Version
-                    };
-
-                    result.Cookies.Add(cookie);
-                    client.CookieContainer.Add(cookie);
-                }
-            }
             return result;
         }
 
@@ -844,5 +712,12 @@ namespace VRChat.API.Client
             return Exec<T>(NewRequest(HttpMethod.Patch, path, options, config), options, config);
         }
         #endregion ISynchronousClient
+
+        #region IDisposable
+        public void Dispose()
+        {
+            _httpClient?.Dispose();
+        }
+        #endregion
     }
 }
